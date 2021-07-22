@@ -16,6 +16,7 @@
 """Library of FFT operations for loss functions and conditioning."""
 
 import crepe
+import ddsp
 from ddsp.core import safe_log
 from ddsp.core import tf_float32
 import gin
@@ -193,7 +194,8 @@ def compute_loudness(audio,
                      n_fft=2048,
                      range_db=LD_RANGE,
                      ref_db=20.7,
-                     use_tf=False):
+                     use_tf=False,
+                     use_buggy_loudness=ddsp.__version__<='1.6.2'):
   """Perceptual loudness in dB, relative to white noise, amplitude=1.
 
   Function is differentiable if use_tf=True.
@@ -235,7 +237,7 @@ def compute_loudness(audio,
   hop_size = sample_rate // frame_rate
   overlap = 1 - hop_size / n_fft
   stft_fn = stft if use_tf else stft_np
-  s = stft_fn(audio, frame_size=n_fft, overlap=overlap, pad_end=True)
+  s = stft_fn(audio, frame_size=n_fft, overlap=overlap, pad_end=False)
 
   # Compute power.
   amplitude = lib.abs(s)
@@ -250,21 +252,31 @@ def compute_loudness(audio,
   loudness -= ref_db
   loudness = lib.maximum(loudness, -range_db)
   mean = tf.reduce_mean if use_tf else np.mean
+  power = tf.math.pow if use_tf else np.power
+  maximum = tf.math.maximum if use_tf else np.maximum
+  log10 = (lambda x: tf.math.log(x) / tf.math.log(10.0)) if use_tf else np.log10
+  concat = tf.concat if use_tf else np.concatenate
 
   # Average over frequency bins.
-  loudness = mean(loudness, axis=-1)
-
-  # Remove temporary batch dimension.
-  loudness = loudness[0] if is_1d else loudness
+  if use_buggy_loudness:
+    loudness = mean(loudness, axis=-1)
+  else:
+    loudness = mean(power(10, loudness / 10.0), axis=-1)
+    loudness = 10.0 * log10(maximum(1e-20, loudness))
 
   # Compute expected length of loudness vector
   n_secs = audio.shape[-1] / float(
       sample_rate)  # `n_secs` can have milliseconds
   expected_len = int(n_secs * frame_rate)
 
-  # Pad with `-range_db` noise floor or trim vector
-  loudness = pad_or_trim_to_expected_length(
-      loudness, expected_len, -range_db, use_tf=use_tf)
+  if loudness.shape[1] < expected_len:
+    loudness = concat([loudness] + [loudness[:,-1:]] * (expected_len - loudness.shape[1]), axis=1)
+  else:
+    loudness = loudness[:,:expected_len]
+
+  # Remove temporary batch dimension.
+  loudness = loudness[0] if is_1d else loudness
+
   return loudness
 
 
